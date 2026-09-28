@@ -93,24 +93,48 @@ get_season_year <- function(date) {
   tibble(season = case_when(m %in% c(12,1,2) ~ "DJF", m %in% 3:5 ~ "MAM", m %in% 6:8 ~ "JJA", TRUE ~ "SON"),
          season_year = if_else(m == 12, y + 1L, y))
 }
-nearest_idx <- function(x, lon, lat) {
-  g <- expand.grid(lon = x$xyCoords$x, lat = x$xyCoords$y)
-  which.min((g$lon-lon)^2 + (g$lat-lat)^2)
+get_surrounding_indices <- function(x, lon, lat) {
+  lon_idx <- order(abs(x$xyCoords$x - lon))[1:2]
+  lat_idx <- order(abs(x$xyCoords$y - lat))[1:2]
+  expand.grid(lon_idx = lon_idx, lat_idx = lat_idx)
 }
-extract_point <- function(x, lon, lat) {
-  i <- nearest_idx(x, lon, lat); nx <- length(x$xyCoords$x)
-  li <- ((i-1) %% nx) + 1; la <- ((i-1) %/% nx) + 1; d <- as.Date(x$Dates$start)
-  tibble(date=d, year=year(d), month=month(d), temp=as.numeric(x$Data[,la,li]))
+extract_monthly_4grid_mean <- function(x, lon, lat) {
+  idx <- get_surrounding_indices(x, lon, lat)
+  temp_mat <- sapply(seq_len(nrow(idx)), function(i) {
+    x$Data[, idx$lat_idx[i], idx$lon_idx[i]]
+  })
+  d <- as.Date(x$Dates$start)
+  tibble(
+    date = d,
+    year = year(d),
+    month = month(d),
+    temp = rowMeans(temp_mat, na.rm = TRUE)
+  )
 }
 annualise <- function(df) df %>% mutate(year=year(date)) %>% group_by(year, dataset) %>% summarise(temp=mean(temp, na.rm=TRUE), .groups="drop")
 load_station <- function(file) {
   read_excel(file) %>% rename(temp=meant) %>% filter(year >= min(future_years), year <= max(future_years)) %>%
     mutate(date=as.Date(sprintf("%04d-%02d-01", year, month))) %>% select(date,year,month,temp)
 }
-raw_point <- function(x, lon, lat) extract_point(x,lon,lat) %>% transmute(date,year,month,temp,dataset="CNRM raw") %>% filter(year %in% future_years)
-bc_point <- function(pred, base, lon, lat) {
-  i <- nearest_idx(base,lon,lat); nx <- length(base$xyCoords$x); li <- ((i-1) %% nx)+1; la <- ((i-1) %/% nx)+1; d <- as.Date(base$Dates$start)
-  tibble(date=d,year=year(d),month=month(d),temp=as.numeric(pred$Data[,la,li]),dataset="CNRM bias-corrected") %>% filter(year %in% future_years)
+raw_4grid <- function(x, lon, lat) {
+  extract_monthly_4grid_mean(x, lon, lat) %>%
+    transmute(date, year, month, temp, dataset="CNRM raw") %>%
+    filter(year %in% future_years)
+}
+bc_4grid <- function(pred, base, lon, lat) {
+  idx <- get_surrounding_indices(base, lon, lat)
+  temp_mat <- sapply(seq_len(nrow(idx)), function(i) {
+    pred$Data[, idx$lat_idx[i], idx$lon_idx[i]]
+  })
+  d <- as.Date(base$Dates$start)
+  tibble(
+    date = d,
+    year = year(d),
+    month = month(d),
+    temp = rowMeans(temp_mat, na.rm = TRUE),
+    dataset = "CNRM bias-corrected"
+  ) %>%
+    filter(year %in% future_years)
 }
 
 # ---- 4. Baseline annual/monthly evaluation ---------------------------------
@@ -140,7 +164,7 @@ write.csv(monthly_metrics,file.path(tab_dir,"Table_3_monthly_metrics.csv"),row.n
 # ---- 5. Figures 2 and 3 -----------------------------------------------------
 base_plot <- function(df, annual=FALSE) {
   ds <- if (annual) bind_rows(era5_a %>% mutate(dataset="ERA5-Land"),cnrm_a %>% mutate(dataset="CNRM"),hadgem_a %>% mutate(dataset="HadGEM"),ec_a %>% mutate(dataset="EC-Earth")) else
-       bind_rows(m_era5 %>% mutate(dataset="ERA5-Land"),m_cnrm %>% mutate(dataset="CNRM"),m_hadgem %>% mutate(dataset="HadGEM"),m_ec %>% mutate(dataset="EC-Earth"))
+    bind_rows(m_era5 %>% mutate(dataset="ERA5-Land"),m_cnrm %>% mutate(dataset="CNRM"),m_hadgem %>% mutate(dataset="HadGEM"),m_ec %>% mutate(dataset="EC-Earth"))
   p <- ggplot(ds,aes(if(annual) year else date,temp,color=dataset)) + geom_line(linewidth=if(annual) .6 else .4)
   if(annual) p <- p + geom_point(size=1) + scale_x_continuous(breaks=seq(1985,2015,5))
   p + scale_color_manual(values=setNames(colours[1:4],c("ERA5-Land","CNRM","HadGEM","EC-Earth"))) +
@@ -201,7 +225,80 @@ row_future <- function(obs,sim,scenario,label) bind_cols(plus(obs$temp,sim$temp)
 table_6 <- bind_rows(row_future(E,R45,"SSP2-4.5","CNRM raw"),row_future(E,B45,"SSP2-4.5","CNRM bias-corrected"),row_future(E,R85,"SSP5-8.5","CNRM raw"),row_future(E,B85,"SSP5-8.5","CNRM bias-corrected")) %>% select(Scenario,Model,RMSE,MBE,MAE,Correlation,Cold,Warm)
 write.csv(table_6,file.path(tab_dir,"Table_6_bias_correction_metrics.csv"),row.names=FALSE)
 
-# ---- 11. Figures 7 and 8 ----------------------------------------------------
+# ---- 11. Figures 6-8 ----------------------------------------------------------
+# Figure 6: annual mean temperature for the county-wide spatial mean.
+get_spatial_mean_ts <- function(x) {
+  spatial_monthly(x) %>% filter(year %in% future_years)
+}
+
+era5_annual_future <- get_spatial_mean_ts(era5_land_9km_mon) %>%
+  group_by(year) %>%
+  summarise(temp = mean(temp, na.rm = TRUE), .groups = "drop") %>%
+  mutate(dataset = "ERA5-Land")
+
+cnrm_raw_annual_45 <- get_spatial_mean_ts(cnrm45_9km) %>%
+  group_by(year) %>%
+  summarise(temp = mean(temp, na.rm = TRUE), .groups = "drop") %>%
+  mutate(dataset = "CNRM raw", Scenario = "SSP2-4.5")
+
+cnrm_bc_annual_45 <- get_spatial_mean_ts(regression_predictions45) %>%
+  group_by(year) %>%
+  summarise(temp = mean(temp, na.rm = TRUE), .groups = "drop") %>%
+  mutate(dataset = "CNRM bias-corrected", Scenario = "SSP2-4.5")
+
+cnrm_raw_annual_85 <- get_spatial_mean_ts(cnrm85_9km) %>%
+  group_by(year) %>%
+  summarise(temp = mean(temp, na.rm = TRUE), .groups = "drop") %>%
+  mutate(dataset = "CNRM raw", Scenario = "SSP5-8.5")
+
+cnrm_bc_annual_85 <- get_spatial_mean_ts(regression_predictions85) %>%
+  group_by(year) %>%
+  summarise(temp = mean(temp, na.rm = TRUE), .groups = "drop") %>%
+  mutate(dataset = "CNRM bias-corrected", Scenario = "SSP5-8.5")
+
+era5_annual_45 <- era5_annual_future %>% mutate(Scenario = "SSP2-4.5")
+era5_annual_85 <- era5_annual_future %>% mutate(Scenario = "SSP5-8.5")
+
+annual_era5_cnrm <- bind_rows(
+  era5_annual_45,
+  cnrm_raw_annual_45,
+  cnrm_bc_annual_45,
+  era5_annual_85,
+  cnrm_raw_annual_85,
+  cnrm_bc_annual_85
+) %>%
+  mutate(
+    year = as.integer(year),
+    dataset = factor(dataset, levels = c("ERA5-Land", "CNRM raw", "CNRM bias-corrected")),
+    Scenario = factor(Scenario, levels = c("SSP2-4.5", "SSP5-8.5"))
+  )
+
+Figure_6 <- ggplot(
+  annual_era5_cnrm,
+  aes(x = year, y = temp, color = dataset)
+) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  facet_wrap(~Scenario, ncol = 1) +
+  scale_x_continuous(breaks = 2015:2025) +
+  labs(
+    title = "Annual Mean Temperature: ERA5-Land and CNRM",
+    x = "Year",
+    y = "Mean Annual Temperature (°C)",
+    color = "Dataset"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    strip.text = element_text(face = "bold", size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+ggsave(file.path(fig_dir, "Figure_6_annual_era5_cnrm.png"), Figure_6, width = 9, height = 7, dpi = 300)
+
+# Figure 7: monthly error distributions.
 err <- bind_rows(R45%>%select(date,CNRM=temp)%>%left_join(E%>%select(date,ERA5=temp),by="date")%>%mutate(Scenario="SSP2-4.5",Type="Raw"),B45%>%select(date,CNRM=temp)%>%left_join(E%>%select(date,ERA5=temp),by="date")%>%mutate(Scenario="SSP2-4.5",Type="Bias corrected"),R85%>%select(date,CNRM=temp)%>%left_join(E%>%select(date,ERA5=temp),by="date")%>%mutate(Scenario="SSP5-8.5",Type="Raw"),B85%>%select(date,CNRM=temp)%>%left_join(E%>%select(date,ERA5=temp),by="date")%>%mutate(Scenario="SSP5-8.5",Type="Bias corrected"))%>%mutate(Error=ERA5-CNRM,Dataset=paste(Scenario,Type))
 Figure_7 <- ggplot(err,aes(Dataset,Error,fill=Type))+geom_boxplot(width=.65)+geom_hline(yintercept=0,linetype="dashed")+scale_x_discrete(limits=c("SSP2-4.5 Raw","SSP2-4.5 Bias corrected","SSP5-8.5 Raw","SSP5-8.5 Bias corrected"))+labs(x="Scenario and dataset",y="Temperature error (°C)",fill="Dataset type",title="Temperature error distribution: CNRM before and after bias correction")+theme_bw()+theme(legend.position="bottom")
 ggsave(file.path(fig_dir,"Figure_7_error_distribution.png"),Figure_7,width=9,height=6,dpi=300)
@@ -210,32 +307,174 @@ bias <- B45%>%select(date,year,month,temp_bc=temp)%>%left_join(E%>%select(date,t
 Figure_8 <- ggplot(bias,aes(factor(year),month_label,fill=bias))+geom_tile(color="white")+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0,limits=c(-4,4),name="Bias (°C)")+labs(title="Monthly Bias: CNRM bias-corrected vs ERA5 Mean (2015-2025)",x="Year",y="Month")+theme_minimal()
 ggsave(file.path(fig_dir,"Figure_8_monthly_bias_heatmap.png"),Figure_8,width=9,height=6,dpi=300)
 
-# ---- 12. Station validation, Tables 7 and Figures 9-10 ----------------------
-safe_station <- function(obs,sim,label) { j<-inner_join(obs,sim,by="date",suffix=c("_obs","_mod")); if(nrow(j)<12)return(tibble(Model=label,RMSE=NA_real_,MBE=NA_real_,Correlation=NA_real_)); compute_metrics(j$temp_obs,j$temp_mod)%>%select(RMSE,MBE,Correlation)%>%mutate(Model=label) }
-station_monthly <- function(st,scenario,base,pred) {
-  o<-load_station(st$file)%>%select(date,temp); r<-raw_point(base,st$lon,st$lat)%>%select(date,temp); b<-bc_point(pred,base,st$lon,st$lat)%>%select(date,temp)
-  bind_rows(safe_station(o,r,"CNRM raw"),safe_station(o,b,"CNRM bias-corrected"))%>%mutate(Station=st$station,Scenario=scenario)
+# ---- 12. Station validation, Table 7 and Figures 9-10 ------------------------
+# All gridded station comparisons use the mean of the four surrounding grid cells.
+# No nearest-grid-point station analysis is included in the reproducible workflow.
+safe_station <- function(obs, sim, label) {
+  j <- inner_join(obs, sim, by = "date", suffix = c("_obs", "_mod"))
+  if (nrow(j) < 12) {
+    return(tibble(Model=label, RMSE=NA_real_, MBE=NA_real_, Correlation=NA_real_))
+  }
+  compute_metrics(j$temp_obs, j$temp_mod) %>%
+    select(RMSE, MBE, Correlation) %>%
+    mutate(Model=label)
 }
-station_annual <- function(st,scenario,base,pred) {
-  o<-load_station(st$file)%>%mutate(dataset="Station")%>%annualise()%>%select(year,temp); r<-raw_point(base,st$lon,st$lat)%>%annualise()%>%select(year,temp); b<-bc_point(pred,base,st$lon,st$lat)%>%annualise()%>%select(year,temp)
-  jr<-inner_join(o,r,by="year",suffix=c("_obs","_mod")); jb<-inner_join(o,b,by="year",suffix=c("_obs","_mod"))
-  bind_rows(compute_metrics(jr$temp_obs,jr$temp_mod),compute_metrics(jb$temp_obs,jb$temp_mod))%>%select(RMSE,MBE,Correlation)%>%mutate(Model=c("CNRM raw","CNRM bias-corrected"),Station=st$station,Scenario=scenario)
+
+station_monthly <- function(st, scenario, base, pred) {
+  o <- load_station(st$file) %>% select(date, temp)
+  r <- raw_4grid(base, st$lon, st$lat) %>% select(date, temp)
+  b <- bc_4grid(pred, base, st$lon, st$lat) %>% select(date, temp)
+  bind_rows(
+    safe_station(o, r, "CNRM raw"),
+    safe_station(o, b, "CNRM bias-corrected")
+  ) %>% mutate(Station=st$station, Scenario=scenario)
 }
-monthly_station_metrics <- bind_rows(lapply(seq_len(nrow(stations)),function(i)bind_rows(station_monthly(stations[i,],"SSP2-4.5",cnrm45_9km,regression_predictions45),station_monthly(stations[i,],"SSP5-8.5",cnrm85_9km,regression_predictions85))) )
-annual_station_metrics <- bind_rows(lapply(seq_len(nrow(stations)),function(i)bind_rows(station_annual(stations[i,],"SSP2-4.5",cnrm45_9km,regression_predictions45),station_annual(stations[i,],"SSP5-8.5",cnrm85_9km,regression_predictions85))) )
-write.csv(monthly_station_metrics,file.path(tab_dir,"station_monthly_metrics.csv"),row.names=FALSE)
-write.csv(annual_station_metrics,file.path(tab_dir,"station_annual_metrics.csv"),row.names=FALSE)
-table_7 <- annual_station_metrics%>%select(Scenario,Station,Model,MBE)%>%pivot_wider(names_from=c(Scenario,Model),values_from=MBE)
-write.csv(table_7,file.path(tab_dir,"Table_7_station_MBE.csv"),row.names=FALSE)
 
-fig9data <- annual_station_metrics%>%mutate(Type=ifelse(Model=="CNRM raw","Raw","Bias-Corrected"),Station=case_when(Station=="CORK AIRPORT"~"Cork Airport",Station=="MOORE PARK"~"Moore Park",Station=="ROCHES POINT"~"Roches Point",TRUE~"Sherkin Island"))
-Figure_9 <- ggplot(fig9data,aes(Station,RMSE,fill=Type))+geom_col(position="dodge")+facet_wrap(~Scenario,ncol=1)+scale_fill_manual(values=c("Raw"="orange","Bias-Corrected"="darkgreen"))+labs(x="Station",y="RMSE (°C)",fill="Model Type",title="Future Performance: Raw vs Bias-Corrected CNRM")+theme_minimal()+theme(axis.text.x=element_text(angle=45,hjust=1),legend.position="bottom")
-ggsave(file.path(fig_dir,"Figure_9_station_RMSE.png"),Figure_9,width=8,height=7,dpi=300)
+station_annual <- function(st, scenario, base, pred) {
+  o <- load_station(st$file) %>% mutate(dataset="Station") %>% annualise() %>% select(year,temp)
+  r <- raw_4grid(base, st$lon, st$lat) %>% annualise() %>% select(year,temp)
+  b <- bc_4grid(pred, base, st$lon, st$lat) %>% annualise() %>% select(year,temp)
+  jr <- inner_join(o, r, by="year", suffix=c("_obs","_mod"))
+  jb <- inner_join(o, b, by="year", suffix=c("_obs","_mod"))
+  bind_rows(
+    compute_metrics(jr$temp_obs, jr$temp_mod),
+    compute_metrics(jb$temp_obs, jb$temp_mod)
+  ) %>%
+    select(RMSE, MBE, Correlation) %>%
+    mutate(Model=c("CNRM raw","CNRM bias-corrected"), Station=st$station, Scenario=scenario)
+}
 
-station_ann_plot <- bind_rows(lapply(seq_len(nrow(stations)),function(i){st<-stations[i,]; bind_rows(load_station(st$file)%>%mutate(dataset="Station",Station=st$station)%>%annualise(),extract_point(era5_land_9km_mon,st$lon,st$lat)%>%filter(year%in%future_years)%>%mutate(dataset="ERA5",Station=st$station)%>%annualise(),raw_point(cnrm45_9km,st$lon,st$lat)%>%annualise()%>%mutate(Scenario="SSP2-4.5",Station=st$station),bc_point(regression_predictions45,cnrm45_9km,st$lon,st$lat)%>%annualise()%>%mutate(Scenario="SSP2-4.5",Station=st$station),raw_point(cnrm85_9km,st$lon,st$lat)%>%annualise()%>%mutate(Scenario="SSP5-8.5",Station=st$station),bc_point(regression_predictions85,cnrm85_9km,st$lon,st$lat)%>%annualise()%>%mutate(Scenario="SSP5-8.5",Station=st$station))}))
-station_ann_plot <- station_ann_plot%>%mutate(Scenario=ifelse(is.na(Scenario),"Observed/reference",Scenario))
-Figure_10 <- ggplot(station_ann_plot,aes(year,temp,color=dataset))+geom_line(linewidth=.8)+facet_grid(Station~Scenario,scales="free_y")+labs(x="Year",y="Temperature (°C)",color="Dataset",title="Annual Mean Temperature by Station and Scenario")+theme_minimal()+theme(axis.text.x=element_text(angle=90,vjust=.5),legend.position="bottom")
-ggsave(file.path(fig_dir,"Figure_10_station_annual_comparison.png"),Figure_10,width=11,height=9,dpi=300)
+monthly_station_metrics <- bind_rows(lapply(seq_len(nrow(stations)), function(i) {
+  bind_rows(
+    station_monthly(stations[i,], "SSP2-4.5", cnrm45_9km, regression_predictions45),
+    station_monthly(stations[i,], "SSP5-8.5", cnrm85_9km, regression_predictions85)
+  )
+}))
+
+annual_station_metrics <- bind_rows(lapply(seq_len(nrow(stations)), function(i) {
+  bind_rows(
+    station_annual(stations[i,], "SSP2-4.5", cnrm45_9km, regression_predictions45),
+    station_annual(stations[i,], "SSP5-8.5", cnrm85_9km, regression_predictions85)
+  )
+}))
+
+write.csv(monthly_station_metrics, file.path(tab_dir,"station_monthly_metrics.csv"), row.names=FALSE)
+write.csv(annual_station_metrics, file.path(tab_dir,"station_annual_metrics.csv"), row.names=FALSE)
+
+table_7 <- annual_station_metrics %>%
+  select(Scenario, Station, Model, MBE) %>%
+  pivot_wider(names_from=c(Scenario,Model), values_from=MBE)
+write.csv(table_7, file.path(tab_dir,"Table_7_station_MBE.csv"), row.names=FALSE)
+
+# Figure 9: annual station comparison using the four surrounding grid cells.
+era5_annual_4grid <- lapply(seq_len(nrow(stations)), function(i) {
+  st <- stations[i,]
+  extract_monthly_4grid_mean(era5_land_9km_mon, st$lon, st$lat) %>%
+    filter(year %in% future_years) %>%
+    mutate(dataset="ERA5") %>%
+    annualise() %>%
+    mutate(Station=st$station)
+}) %>% bind_rows()
+
+era5_annual_4grid_45 <- era5_annual_4grid %>% mutate(Scenario="SSP2-4.5")
+era5_annual_4grid_85 <- era5_annual_4grid %>% mutate(Scenario="SSP5-8.5")
+
+cnrm_raw_annual_4grid_45 <- lapply(seq_len(nrow(stations)), function(i) {
+  st <- stations[i,]
+  raw_4grid(cnrm45_9km, st$lon, st$lat) %>%
+    annualise() %>%
+    mutate(Station=st$station, Scenario="SSP2-4.5")
+}) %>% bind_rows()
+
+cnrm_bc_annual_4grid_45 <- lapply(seq_len(nrow(stations)), function(i) {
+  st <- stations[i,]
+  bc_4grid(regression_predictions45, cnrm45_9km, st$lon, st$lat) %>%
+    annualise() %>%
+    mutate(Station=st$station, Scenario="SSP2-4.5")
+}) %>% bind_rows()
+
+cnrm_raw_annual_4grid_85 <- lapply(seq_len(nrow(stations)), function(i) {
+  st <- stations[i,]
+  raw_4grid(cnrm85_9km, st$lon, st$lat) %>%
+    annualise() %>%
+    mutate(Station=st$station, Scenario="SSP5-8.5")
+}) %>% bind_rows()
+
+cnrm_bc_annual_4grid_85 <- lapply(seq_len(nrow(stations)), function(i) {
+  st <- stations[i,]
+  bc_4grid(regression_predictions85, cnrm85_9km, st$lon, st$lat) %>%
+    annualise() %>%
+    mutate(Station=st$station, Scenario="SSP5-8.5")
+}) %>% bind_rows()
+
+station_annual_45 <- lapply(seq_len(nrow(stations)), function(i) {
+  st <- stations[i,]
+  load_station(st$file) %>%
+    mutate(dataset="Station") %>%
+    annualise() %>%
+    mutate(Station=st$station, Scenario="SSP2-4.5")
+}) %>% bind_rows()
+
+station_annual_85 <- station_annual_45 %>% mutate(Scenario="SSP5-8.5")
+
+annual_4grid_all <- bind_rows(
+  station_annual_45, station_annual_85,
+  era5_annual_4grid_45, era5_annual_4grid_85,
+  cnrm_raw_annual_4grid_45, cnrm_bc_annual_4grid_45,
+  cnrm_raw_annual_4grid_85, cnrm_bc_annual_4grid_85
+) %>% mutate(year=as.integer(year))
+
+# Match the manuscript Figure 9 styling and content.
+colour_map <- c(
+  "Station" = "black",
+  "ERA5" = unname(colours[1]),
+  "CNRM raw" = unname(colours[2]),
+  "CNRM bias-corrected" = unname(colours[3])
+)
+
+Figure_9 <- ggplot(annual_4grid_all, aes(x=year, y=temp, color=dataset)) +
+  geom_line(size=1) +
+  facet_wrap(~Station + Scenario, ncol=4, scales="free_y") +
+  scale_color_manual(values=colour_map) +
+  scale_x_continuous(breaks=seq(min(annual_4grid_all$year), max(annual_4grid_all$year), by=1)) +
+  labs(
+    title="Annual Mean Temperature by Station and Scenario (4-grid mean for all gridded datasets)",
+    x="Year", y="Temperature (°C)", color="Dataset"
+  ) +
+  theme_minimal(base_size=12) +
+  theme(
+    plot.title=element_text(hjust=0.5),
+    strip.text=element_text(face="bold"),
+    axis.text.x=element_text(angle=90, vjust=0.5, hjust=1)
+  )
+ggsave(file.path(fig_dir,"Figure_9_station_annual_comparison.png"), Figure_9, width=9, height=6, dpi=300)
+
+# Figure 10: RMSE against station observations. This is retained as the manuscript figure.
+fig10data <- monthly_station_metrics %>%
+  mutate(
+    Type=ifelse(Model=="CNRM raw","Raw","Bias-Corrected"),
+    Station=case_when(
+      Station=="CORK AIRPORT"~"Cork Airport",
+      Station=="MOORE PARK"~"Moore Park",
+      Station=="ROCHES POINT"~"Roches Point",
+      TRUE~"Sherkin Island"
+    )
+  )
+
+Figure_10 <- ggplot(fig10data,aes(Station,RMSE,fill=Type)) +
+  geom_col(position="dodge") +
+  facet_wrap(~Scenario,ncol=1) +
+  scale_fill_manual(values=c("Raw"="orange","Bias-Corrected"="darkgreen")) +
+  labs(
+    x="Station",
+    y="RMSE (°C)",
+    fill="Model Type",
+    title="Future Performance: Raw vs Bias-Corrected CNRM"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x=element_text(angle=45,hjust=1),legend.position="bottom")
+
+ggsave(file.path(fig_dir,"Figure_10_station_RMSE.png"), Figure_10, width=8, height=7, dpi=300)
 
 # ---- 13. Completion ---------------------------------------------------------
 message("Analysis completed. Figures: ", normalizePath(fig_dir), " | Tables: ", normalizePath(tab_dir))
